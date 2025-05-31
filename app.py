@@ -25,7 +25,7 @@ DB_CONFIG = {
     "charset": "utf8mb4"
 }
 
-# SQLAlchemy 엔진 생성 (경고 방지용)
+# SQLAlchemy 엔진 생성
 SQLALCHEMY_DB_URL = "mysql+pymysql://solar_user:solar_pass_2025@localhost/solar_forecast_muan"
 engine = create_engine(SQLALCHEMY_DB_URL)
 
@@ -36,8 +36,22 @@ def mean_absolute_percentage_error(y_true, y_pred):
     epsilon = np.finfo(np.float64).eps
     return np.mean(np.abs((y_true - y_pred) / np.maximum(np.abs(y_true), epsilon))) * 100
 
-# 기상청 7일 예보 크롤링 함수
-# (현재는 무작위 값 사용 - 실제 구조로 파싱 필요)
+# 전체 성능 지표 계산 함수
+def evaluate_overall_performance(y_true, y_pred):
+    y_true = np.array(y_true)
+    y_pred = np.array(y_pred)
+
+    # 0이 아닌 값만 필터링하여 MAPE 안정화
+    nonzero_mask = y_true > 0
+    y_true_filtered = y_true[nonzero_mask]
+    y_pred_filtered = y_pred[nonzero_mask]
+
+    rmse = np.sqrt(mean_squared_error(y_true_filtered, y_pred_filtered))
+    mae = mean_absolute_error(y_true_filtered, y_pred_filtered)
+    mape = mean_absolute_percentage_error(y_true_filtered, y_pred_filtered)
+    return rmse, mae, mape
+
+# 기상청 7일 예보 크롤링 함수 (무작위 값 사용 중)
 def crawl_weather_forecast():
     url = "https://www.weather.go.kr/w/index.do#dong/4684033000/34.90858290832377/126.43440261942119"
     headers = {"User-Agent": "Mozilla/5.0"}
@@ -91,7 +105,7 @@ def load_daily_data():
             AVG(forecast_temperature_c) AS forecast_temperature,
             AVG(forecast_wind_speed_ms) AS forecast_wind
         FROM measurement
-        WHERE measured_at BETWEEN CURDATE() - INTERVAL 60 DAY AND CURDATE() + INTERVAL 7 DAY
+        WHERE measured_at <= CURDATE() + INTERVAL 7 DAY
         GROUP BY DATE(measured_at)
         ORDER BY date
     """
@@ -113,7 +127,7 @@ def save_forecast_daily(forecast_date, predicted_mwh, actual_mwh=None, rmse=None
     conn.commit()
     conn.close()
 
-# 예측 수행 함수
+# 예측 수행 함수 (오늘 포함 7일)
 def run_sarima_forecast():
     try:
         df = load_daily_data()
@@ -122,42 +136,53 @@ def run_sarima_forecast():
         train = df[df.index < today]
         future = df[df.index >= today]
 
-        train_y = np.log1p(train["power_mw"])
+        # 로그 변환 제거로 안정성 향상
+        train_y = train["power_mw"]
         train_y = train_y.asfreq("D")
 
-        exog_cols = ["forecast_irradiance", "forecast_temperature", "forecast_wind"]
+        # 외생변수 제거: SARIMA 내부 시계열만 사용
+        exog_cols = None
+        train_exog = None
+        future_exog = None
 
-        scaler = StandardScaler()
-        train_exog = scaler.fit_transform(train[exog_cols])
-        future_exog = scaler.transform(future[exog_cols])
-
-        n_forecast = 6
-        if future_exog.shape[0] < (n_forecast + 1):
-            return f"❌ 예측에 필요한 외생 변수가 부족합니다. 최소 {n_forecast + 1}일치가 필요하지만 현재 {future_exog.shape[0]}일치만 존재합니다."
+        n_forecast = 7
+        if future.shape[0] < n_forecast:
+            return f"❌ 예측에 필요한 데이터가 부족합니다. 최소 {n_forecast}일치가 필요하지만 현재 {future.shape[0]}일치만 존재합니다."
 
         model = SARIMAX(train_y,
-                        exog=train_exog,
-                        order=(1,1,1),
+                        order=(2,1,2),
                         seasonal_order=(1,1,1,7),
                         enforce_stationarity=False,
                         enforce_invertibility=False)
         model_fit = model.fit(disp=False)
+        forecast_log = model_fit.forecast(steps=n_forecast)
+        MAX_CAPACITY_PER_DAY_MWH = 4000  # 상한선 4000MWh로 고정
+        max_train_value = min(train["power_mw"].max() * 1.2, MAX_CAPACITY_PER_DAY_MWH)
+        forecast_mwh = forecast_log.clip(0, max_train_value)
+        if (forecast_mwh >= max_train_value).any():
+            print(f"⚠️ 일부 예측값이 설비 한계({max_train_value:.2f} MWh/day)를 초과하여 clip 되었습니다.")
+        actual_mwh = future["power_mw"][:n_forecast] if "power_mw" in future else np.full(n_forecast, np.nan)
 
-        forecast_log = model_fit.forecast(steps=n_forecast, exog=future_exog[1:1+n_forecast])
-        forecast_mwh = np.expm1(forecast_log).clip(0, 4000)
-        actual_mwh = future["power_mw"][1:1+n_forecast] if "power_mw" in future else np.full(n_forecast, np.nan)
+        y_true, y_pred = [], []
 
         for i in range(n_forecast):
-            date = future.index[i+1]
+            date = future.index[i]
             predicted = float(forecast_mwh.iloc[i])
             actual = float(actual_mwh.iloc[i]) if hasattr(actual_mwh, 'iloc') and not np.isnan(actual_mwh.iloc[i]) else None
             if actual is not None:
                 rmse = np.sqrt(mean_squared_error([actual], [predicted]))
                 mae = mean_absolute_error([actual], [predicted])
                 mape = mean_absolute_percentage_error([actual], [predicted])
+                y_true.append(actual)
+                y_pred.append(predicted)
             else:
                 rmse = mae = mape = None
             save_forecast_daily(date, predicted, actual, rmse, mae, mape)
+
+        if y_true and y_pred:
+            overall_rmse, overall_mae, overall_mape = evaluate_overall_performance(y_true, y_pred)
+            print("✅ 전체 예측 성능:")
+            print(f"RMSE: {overall_rmse:.2f} | MAE: {overall_mae:.2f} | MAPE: {overall_mape:.2f}%")
 
         return forecast_mwh.tolist()
     except Exception as e:
@@ -173,7 +198,7 @@ def forecast_sarima():
             return jsonify({"status": "error", "message": result})
 
         today = datetime.now(KST).date()
-        dates = [(today + timedelta(days=i+1)).strftime("%Y-%m-%d") for i in range(len(result))]
+        dates = [(today + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(len(result))]
         rows = zip(dates, result)
 
         html = """
